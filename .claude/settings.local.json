@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(cargo --version:*)",
+      "Bash(cargo init:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo build:*)",
+      "Bash(/Users/alice/Projects/private/shorts/svc/target/debug/arc task list:*)",
+      "Bash(/Users/alice/Projects/private/shorts/svc/target/debug/arc change:*)",
+      "Bash(/Users/alice/Projects/private/shorts/svc/target/debug/arc log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(/Users/alice/Projects/private/shorts/svc/target/debug/arc task new:*)",
+      "Bash(/Users/alice/Projects/private/shorts/svc/target/debug/arc save:*)",
+      "Bash(xxd:*)",
+      "Bash(ARC=/Users/alice/Projects/private/shorts/svc/target/debug/arc)",
+      "Bash($ARC undo)",
+      "Bash($ARC log --all)",
+      "Bash(ls:*)",
+      "Bash($ARC eject)",
+      "Bash($ARC shell-init:*)",
+      "Bash(chmod:*)",
+      "Bash(bash:*)"
+    ]
+  }
+}
