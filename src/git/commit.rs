@@ -49,6 +49,30 @@ pub fn create_empty_commit(
     Ok(oid)
 }
 
+/// Amend the most recent commit: stage changes, rewrite the commit with new message/metadata.
+pub fn amend_commit(
+    repo: &Repository,
+    summary: &str,
+    intent: Option<&str>,
+    metadata: &CommitMetadata,
+) -> Result<git2::Oid> {
+    let workdir = repo.workdir().context("bare repo not supported")?;
+    stage_all(workdir)?;
+
+    let mut index = repo.index()?;
+    let tree_oid = index.write_tree()?;
+    let tree = repo.find_tree(tree_oid)?;
+
+    let head = repo.head().context("No HEAD to amend")?;
+    let old_commit = head.peel_to_commit()?;
+
+    let sig = repo.signature().or_else(|_| Signature::now("Arc User", "arc@localhost"))?;
+    let message = commit_message::format(summary, intent, metadata);
+
+    let oid = old_commit.amend(Some("HEAD"), Some(&sig), Some(&sig), None, Some(&message), Some(&tree))?;
+    Ok(oid)
+}
+
 /// Create a revert commit for the given commit SHA, and update the working tree.
 pub fn revert_commit(repo: &Repository, target: git2::Oid) -> Result<git2::Oid> {
     let commit = repo.find_commit(target)?;

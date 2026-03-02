@@ -68,6 +68,50 @@ pub fn run(
     Ok(())
 }
 
+/// Amend the most recent change — stages changes, rewrites the commit, updates the change-map.
+pub fn run_amend(
+    summary: String,
+    intent: Option<String>,
+    agent: bool,
+    model: Option<String>,
+) -> Result<()> {
+    let ctx = ArcContext::open()?;
+    let task_id = ctx.current_task_id()?;
+
+    // Find the most recent active change to amend
+    let (change_id, old_summary) = find_current_change(&ctx, task_id.as_deref())?
+        .context("No active change to amend")?;
+
+    let is_agent = agent || model.is_some();
+    let author_type_str = if is_agent { "agent" } else { "human" };
+    let task_ref = find_task_ref(&ctx, task_id.as_deref())?;
+
+    let metadata = CommitMetadata {
+        change_id: Some(change_id.clone()),
+        author_type: Some(author_type_str.into()),
+        author_model: model.clone(),
+        task_id: task_id.clone(),
+        change_type: Some("change".into()),
+        task_ref,
+        ..Default::default()
+    };
+
+    let oid = git::commit::amend_commit(&ctx.repo, &summary, intent.as_deref(), &metadata)?;
+    let sha = oid.to_string();
+
+    ctx.db.execute(
+        "UPDATE changes SET git_sha = ?1, summary = ?2, intent = ?3, author_model = ?4 WHERE id = ?5",
+        rusqlite::params![sha, summary, intent, model, change_id],
+    )?;
+
+    update_change_map(&ctx, &change_id, &sha)?;
+
+    let short_id = &change_id[..8];
+    println!("Amended [{short_id}]: {old_summary} → {summary}");
+
+    Ok(())
+}
+
 /// Checkpoint: create a new lightweight commit for recovery.
 pub fn run_checkpoint(
     message: Option<String>,

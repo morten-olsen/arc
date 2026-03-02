@@ -2,12 +2,16 @@ use anyhow::{bail, Result};
 
 use crate::context::ArcContext;
 
-pub fn run() -> Result<()> {
+pub fn run(force: bool) -> Result<()> {
     let ctx = ArcContext::open()?;
 
     // Push current branch
+    let mut args = vec!["push"];
+    if force {
+        args.push("--force-with-lease");
+    }
     let status = std::process::Command::new("git")
-        .args(["push"])
+        .args(&args)
         .current_dir(&ctx.repo_root)
         .status()?;
 

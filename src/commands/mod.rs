@@ -50,6 +50,10 @@ pub enum Command {
         /// Model name (implies --agent)
         #[arg(long)]
         model: Option<String>,
+
+        /// Amend the most recent commit instead of creating a new one
+        #[arg(long)]
+        amend: bool,
     },
 
     /// Save a lightweight checkpoint
@@ -102,7 +106,11 @@ pub enum Command {
     },
 
     /// Push code and metadata to remote
-    Push,
+    Push {
+        /// Force push (use with caution)
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Pull code and metadata from remote
     Pull,
@@ -132,8 +140,12 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Init => init::run(),
         Command::ShellInit => init::run_shell_init(),
         Command::Task(cmd) => task::run(cmd),
-        Command::Change { summary, intent, agent, model } => {
-            change::run(summary, intent, agent, model)
+        Command::Change { summary, intent, agent, model, amend } => {
+            if amend {
+                change::run_amend(summary, intent, agent, model)
+            } else {
+                change::run(summary, intent, agent, model)
+            }
         }
         Command::Checkpoint { message, agent, model } => {
             change::run_checkpoint(message, agent, model)
@@ -143,7 +155,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Undo { to } => undo::run(to),
         Command::Log { all, task } => log::run(all, task),
-        Command::Push => push::run(),
+        Command::Push { force } => push::run(force),
         Command::Pull => pull::run(),
         Command::Intent { file, line } => intent::run(file, line),
         Command::Eject => eject::run(),

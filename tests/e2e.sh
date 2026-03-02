@@ -102,6 +102,11 @@ git clone remote.git repo --quiet 2>&1
 cd repo
 git config user.email "test@test.com"
 git config user.name "Test User"
+git config commit.gpgsign false
+git config tag.gpgsign false
+git config gpg.format openpgp
+git config --unset gpg.program 2>/dev/null || true
+git config --unset gpg.ssh.program 2>/dev/null || true
 echo "hello" > README.md
 git add -A && git commit -m "initial commit" --quiet
 git push origin main --quiet 2>&1
@@ -281,6 +286,127 @@ assert_contains "sync rebases" "$OUT" "Sync complete"
 # Verify upstream commit is in history
 OUT=$(git log --oneline 2>&1)
 assert_contains "sync includes upstream" "$OUT" "upstream work"
+
+# ─── Test: arc change --amend ────────────────────────────────────────
+
+cd "$TMPDIR/repo"
+TASK_OUT=$($ARC_BIN task new "Amend test" 2>&1)
+WORKTREE5="$(echo "$TASK_OUT" | grep "Worktree:" | sed 's/.*Worktree: *//' | sed 's|/$||')"
+cd "$WORKTREE5"
+
+echo "original" > amend.rs
+OUT=$($ARC_BIN change "Original summary" --intent "Original intent" 2>&1)
+assert_contains "amend: initial change created" "$OUT" "Change ["
+
+# Capture the change id from the commit message trailers
+AMEND_SHA_BEFORE=$(git rev-parse HEAD)
+
+echo "updated" >> amend.rs
+OUT=$($ARC_BIN change --amend "Amended summary" --intent "Updated intent" 2>&1)
+assert_contains "amend: reports amended" "$OUT" "Amended ["
+assert_contains "amend: shows old → new" "$OUT" "Original summary"
+assert_contains "amend: shows new summary" "$OUT" "Amended summary"
+
+# SHA should have changed (amend rewrites the commit)
+AMEND_SHA_AFTER=$(git rev-parse HEAD)
+if [ "$AMEND_SHA_BEFORE" != "$AMEND_SHA_AFTER" ]; then
+    pass "amend: commit SHA changed"
+else
+    fail "amend: commit SHA changed" "SHA is still $AMEND_SHA_BEFORE"
+fi
+
+# The commit message should have the new summary
+OUT=$(git log -1 --format=%s 2>&1)
+assert_contains "amend: git log shows new summary" "$OUT" "Amended summary"
+
+# The arc trailer should still be present
+OUT=$(git log -1 --format=%B 2>&1)
+assert_contains "amend: trailer preserved" "$OUT" "arc:change:id:"
+
+# Only one task commit on this branch (above whatever is on main)
+MERGE_BASE=$(git merge-base HEAD origin/main)
+COMMIT_COUNT=$(git rev-list --count "$MERGE_BASE"..HEAD)
+if [ "$COMMIT_COUNT" -eq 1 ]; then
+    pass "amend: still 1 task commit"
+else
+    fail "amend: still 1 task commit" "got $COMMIT_COUNT"
+fi
+
+# arc log should show the updated summary
+OUT=$($ARC_BIN log 2>&1)
+assert_contains "amend: log shows new summary" "$OUT" "Amended summary"
+assert_not_contains "amend: log hides old summary" "$OUT" "Original summary"
+
+# ─── Test: arc push --force ─────────────────────────────────────────
+
+# Push the task branch first (normal push to set up tracking)
+git push -u origin HEAD --quiet 2>&1
+
+# Amend again to create divergence from remote
+echo "force update" >> amend.rs
+$ARC_BIN change --amend "Force-amended summary" 2>&1 >/dev/null
+
+# Normal push should fail (diverged)
+set +e
+OUT=$(git push 2>&1)
+PUSH_EXIT=$?
+set -e
+if [ "$PUSH_EXIT" -ne 0 ]; then
+    pass "push: normal push rejected after amend"
+else
+    fail "push: normal push rejected after amend" "push succeeded unexpectedly"
+fi
+
+# arc push --force should succeed
+OUT=$($ARC_BIN push --force 2>&1)
+assert_contains "push --force: succeeds" "$OUT" "Pushed."
+
+# ─── Test: derived-from trailer (renamed from squashed-from) ────────
+
+# Verify the format/parse roundtrip via commit message
+cd "$TMPDIR/repo"
+TASK_OUT=$($ARC_BIN task new "Derived-from test" 2>&1)
+WORKTREE6="$(echo "$TASK_OUT" | grep "Worktree:" | sed 's/.*Worktree: *//' | sed 's|/$||')"
+cd "$WORKTREE6"
+
+echo "a" > a.rs
+$ARC_BIN change "Change A" 2>&1 >/dev/null
+echo "b" > b.rs
+$ARC_BIN change "Change B" 2>&1 >/dev/null
+
+# Manually write a commit with derived-from trailer to verify parsing
+CHANGE_A_ID=$(git log --format=%B 2>&1 | grep "arc:change:id:" | tail -1 | sed 's/arc:change:id: //')
+CHANGE_B_ID=$(git log --format=%B 2>&1 | grep "arc:change:id:" | head -1 | sed 's/arc:change:id: //')
+
+# Create a commit message with arc:derived-from trailer and verify it parses
+DERIVED_MSG="Squash merge of test
+
+---
+arc:change:id: test-derived-uuid
+arc:derived-from: $CHANGE_A_ID, $CHANGE_B_ID
+"
+echo "merged" > merged.rs
+git add -A
+git commit -m "$DERIVED_MSG" --quiet 2>&1
+
+OUT=$(git log -1 --format=%B 2>&1)
+assert_contains "derived-from: trailer in commit" "$OUT" "arc:derived-from:"
+assert_contains "derived-from: has change A" "$OUT" "$CHANGE_A_ID"
+assert_contains "derived-from: has change B" "$OUT" "$CHANGE_B_ID"
+
+# Also verify backward compat: a commit with old squashed-from trailer
+OLD_MSG="Old squash merge
+
+---
+arc:change:id: test-old-uuid
+arc:squashed-from: old-1, old-2
+"
+echo "old" > old.rs
+git add -A
+git commit -m "$OLD_MSG" --quiet 2>&1
+
+OUT=$(git log -1 --format=%B 2>&1)
+assert_contains "squashed-from compat: old trailer in commit" "$OUT" "arc:squashed-from:"
 
 # ─── Results ──────────────────────────────────────────────────────────
 

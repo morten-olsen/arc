@@ -23,7 +23,11 @@
       "Bash($ARC eject)",
       "Bash($ARC shell-init:*)",
       "Bash(chmod:*)",
-      "Bash(bash:*)"
+      "Bash(bash:*)",
+      "Bash(test:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(find:*)"
     ]
   }
 }

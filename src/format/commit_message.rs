@@ -8,7 +8,7 @@ pub struct CommitMetadata {
     pub session_id: Option<String>,
     pub confidence: Option<f64>,
     pub prompt_hash: Option<String>,
-    pub squashed_from: Vec<String>,
+    pub derived_from: Vec<String>,
     pub change_type: Option<String>,
     pub parent_change_summary: Option<String>,
     pub task_ref: Option<String>,
@@ -58,10 +58,10 @@ pub fn format(summary: &str, intent: Option<&str>, metadata: &CommitMetadata) ->
     if let Some(ref hash) = metadata.prompt_hash {
         msg.push_str(&format!("\narc:prompt:hash: {hash}"));
     }
-    if !metadata.squashed_from.is_empty() {
+    if !metadata.derived_from.is_empty() {
         msg.push_str(&format!(
-            "\narc:squashed-from: {}",
-            metadata.squashed_from.join(", ")
+            "\narc:derived-from: {}",
+            metadata.derived_from.join(", ")
         ));
     }
 
@@ -116,8 +116,11 @@ pub fn parse(message: &str) -> Option<CommitMetadata> {
         } else if let Some(value) = line.strip_prefix("arc:prompt:hash: ") {
             meta.prompt_hash = Some(value.to_string());
             found_any = true;
+        } else if let Some(value) = line.strip_prefix("arc:derived-from: ") {
+            meta.derived_from = value.split(", ").map(String::from).collect();
         } else if let Some(value) = line.strip_prefix("arc:squashed-from: ") {
-            meta.squashed_from = value.split(", ").map(String::from).collect();
+            // Backward compat: read old trailer format
+            meta.derived_from = value.split(", ").map(String::from).collect();
             found_any = true;
         }
     }

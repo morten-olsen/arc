@@ -60,20 +60,23 @@ Pulling from origin...
 ```json
 {
   "id": "uuid-sq",
+  "parent": null,
   "git_commit": "x9y8z7",
+  "author": {
+    "type": "human",
+    "identity": "marcus"
+  },
   "summary": "Squash merge of PAYMENT-RETRY",
-  "squashed_from": ["uuid-1", "uuid-2", "uuid-3"],
-  "authors": [
-    { "type": "human", "identity": "marcus" },
-    { "type": "agent", "identity": "claude-sonnet-4-5", "model": "claude-sonnet-4-5" }
-  ],
-  "task": "f7a1b2c3",
   "intent": "Combined: Define retry interface + Implement retry logic + Add circuit breaker",
-  "reconciled_at": "2026-03-01T14:30:00Z"
+  "derived_from": ["uuid-1", "uuid-2", "uuid-3"],
+  "tags": ["squash-merge"],
+  "created_at": "2026-03-01T14:30:00Z"
 }
 ```
 
-The original Changes (uuid-1, uuid-2, uuid-3) remain in the metadata store with all their detail — prompts, reasoning, session transcripts. They're linked to the squash Change via `squashed_from`.
+> **Note:** design.md defines `derived_from` as `Change id | null` (singular). For squash reconciliation, Arc extends this to an array of Change ids to capture all source Changes. The original per-change authors are preserved in the linked Changes.
+
+The original Changes (uuid-1, uuid-2, uuid-3) remain in the metadata store with all their detail — prompts, reasoning, session transcripts. They're linked to the squash Change via `derived_from`.
 
 ### Blame After Squash
 
@@ -151,8 +154,8 @@ After rebase onto updated main:
 ### How Arc Handles It
 
 ```
-$ arc pull --rebase
-  # or: arc task rebase main
+$ arc task sync
+  # or: git rebase main (Arc detects on next operation)
 
   1. Record pre-rebase state: { uuid-1: d4e5f6, uuid-2: g7h8i9 }
   2. Perform: git rebase main
@@ -187,12 +190,7 @@ change-map: { uuid-1: a1b2c3 } → { uuid-1: NEW-SHA }
 
 If the user rewrites the message and removes the trailer, Arc falls back to content-hash matching to re-link the metadata.
 
-Arc also provides `arc amend` which handles this automatically:
-
-```
-$ arc amend
-  # stages changes, amends the Git commit, updates change-map
-```
+Arc can also wrap this via `arc change --amend`, which stages changes, amends the Git commit, and updates the change-map in one step. When the user runs plain `git commit --amend` instead, Arc detects the amended commit on the next operation and re-indexes automatically.
 
 ## Cherry-Pick
 
@@ -227,6 +225,8 @@ The same UUID now appears in two commits on different branches. Arc's change-map
 
 The `canonical` field points to the original. The Change metadata (intent, reasoning, agent info) is shared — it describes the same logical change regardless of which branch it's on.
 
+> **Note:** This multi-branch mapping is a change-map extension beyond design.md's `derived_from` field. The cherry-picked commit retains the same UUID in its message, creating a one-UUID-to-many-commits situation that the change-map must track. The `derived_from` field on a new Change can also represent cherry-pick lineage when the cherry-pick produces a distinct Change.
+
 `arc log` on either branch shows the full metadata. `arc blame` on either branch attributes the code correctly.
 
 ## Force Push
@@ -237,14 +237,12 @@ Force push replaces remote history. This is destructive from Git's perspective b
 
 ```
 $ arc push --force
-  # or: git push --force (Arc detects on next pull)
-
   1. Push code (new SHAs go to remote)
   2. Rebuild change-map from current branch state
   3. Push updated refs/arc/* with new mappings
 ```
 
-Other developers who `arc pull` after a force push go through the same reconciliation — re-scan commits for UUIDs, rebuild the change-map, fall back to content-hash matching if needed.
+When a developer runs `git push --force` directly (bypassing Arc), the remote history is rewritten but `refs/arc/*` are not updated. Arc reconciles on the next operation by any developer: `arc pull` detects that commit SHAs in the change-map no longer match the branch and triggers a re-scan — walking commits for UUIDs, rebuilding the change-map, and falling back to content-hash matching if needed.
 
 ## Interactive Rebase (Reorder, Edit, Drop)
 
@@ -268,18 +266,20 @@ Line-level blame is updated accordingly. Lines matching hash-A still attribute t
 
 ### Drop
 
-A commit is removed entirely. Its code is gone from the branch. Arc marks the Change as orphaned:
+A commit is removed entirely. Its code is gone from the branch. Arc records the orphan status as a change-map annotation — the Change itself in `refs/arc/` is preserved as-is:
 
-```json
+```
+Change-map entry for a dropped commit:
 {
-  "id": "uuid-dropped",
-  "status": "orphaned",
-  "orphaned_reason": "commit dropped during interactive rebase",
-  "orphaned_at": "2026-03-01T15:00:00Z"
+  "uuid-dropped": {
+    "status": "orphaned",
+    "reason": "commit dropped during interactive rebase",
+    "orphaned_at": "2026-03-01T15:00:00Z"
+  }
 }
 ```
 
-The metadata is preserved (it might be useful for understanding what was tried and discarded) but the Change is no longer linked to any commit on the current branch.
+The Change metadata is preserved in `refs/arc/` (it might be useful for understanding what was tried and discarded). The orphan status is an index-level annotation in the change-map, not a mutation of the Change struct itself. The Change is no longer linked to any commit on the current branch.
 
 ## Merge Commit (No Squash)
 
@@ -303,7 +303,7 @@ $ arc task complete
 | **Rebase** | Changed | Preserved | Preserved | Re-indexed via UUID | Intact |
 | **Amend** | Changed | Usually preserved | Usually preserved | Re-indexed via UUID | Updated |
 | **Cherry-pick** | New SHA | Preserved | Preserved | Multi-branch mapping | Intact |
-| **Squash (Arc)** | New SHA | Arc-controlled | New trailer with lineage | Linked via squashed-from | Re-indexed |
+| **Squash (Arc)** | New SHA | Arc-controlled | New trailer with lineage | Linked via derived-from | Re-indexed |
 | **Squash (GitHub)** | New SHA | Rewritten | Lost | Reconciled via detection | Re-indexed |
 | **Force push** | Changed | Preserved | Preserved | Re-indexed on pull | Intact |
 | **Interactive rebase** | Changed | Preserved (unless edited) | Preserved (unless edited) | Re-indexed, orphaned if dropped | Updated |
