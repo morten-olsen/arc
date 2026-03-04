@@ -328,6 +328,19 @@ $ arc checkpoint
 
 Tasks add isolation via worktrees. Without a task, `arc change` and `arc checkpoint` still work — you get structured commits on whatever branch you're on.
 
+If the work grows and you realize it should have been a task, promote existing commits retroactively:
+
+```
+$ arc task adopt "Fix typo and related cleanup" --last 2
+
+Created task: Fix typo and related cleanup
+  Branch:   task/e1f2a3b4-fix-typo-and-related-cleanup
+  Worktree: .arc/worktrees/fix-typo-and-related-cleanup
+  Adopted:  2 commit(s)
+```
+
+The commits move to a new task branch and worktree. Your original branch is reset to before those commits — no work lost.
+
 ---
 
 ## Agent-authored code
@@ -420,6 +433,7 @@ Or just stop using `arc` commands and use `git` directly. The repo is a normal G
 | `arc task finalize` | Squash checkpoints into clean atomic commits |
 | `arc task complete` | Clean up worktree and branch after merge |
 | `arc task abandon [--reason "..."]` | Drop a task, record why in metadata |
+| `arc task adopt "goal" [--last N] [--since <ref>] [--ref TICKET]` | Promote existing commits into a new task |
 | `arc change "summary" [--intent "why"]` | Declare a new change (squash boundary) |
 | `arc checkpoint ["message"]` | Save work (belongs to current change) |
 | `arc fix <change-id> ["message"]` | Save work linked to a specific earlier change |

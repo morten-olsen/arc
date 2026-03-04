@@ -487,6 +487,21 @@ $ arc push
 
 `arc change` and `arc checkpoint` work on any branch, with or without a task. Tasks add isolation and structure. Without a task, you get structured commits on whatever branch you're on.
 
+But sometimes work grows. What started as a quick fix turns into a multi-commit effort. Promote it to a task retroactively:
+
+```
+$ arc task adopt "Update API timeout and related config" --last 2
+
+Created task: Update API timeout and related config
+  Branch:   task/f1e2d3c4-update-api-timeout-and-related-config
+  Worktree: .arc/worktrees/update-api-timeout-and-related-config
+  Adopted:  2 commit(s)
+```
+
+The commits are cherry-picked into the new task branch with `arc:task:` trailers added. Main is reset to before the adopted commits. Plain git commits get full arc metadata; existing arc commits preserve their metadata.
+
+You can also use `--since <ref>` to adopt everything after a specific commit, or omit flags entirely to adopt all commits ahead of the upstream tracking branch.
+
 ---
 
 ## Commit Message Format
@@ -559,6 +574,7 @@ After `arc task finalize`, only the change commits remain — checkpoints and fi
 | `arc task finalize` | Squash checkpoints into clean commits |
 | `arc task complete` | Clean up worktree and branch after merge |
 | `arc task abandon [--reason "..."]` | Drop a task, record why |
+| `arc task adopt "goal" [--last N] [--since <ref>] [--ref TICKET]` | Promote existing commits into a new task |
 | `arc change "summary" [--intent "..."]` | Declare a new change (squash boundary) |
 | `arc checkpoint ["message"]` | Save work (belongs to current change) |
 | `arc fix <change-id> ["message"]` | Save work linked to a specific change |

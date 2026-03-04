@@ -56,6 +56,24 @@ pub enum TaskCommand {
 
     /// Squash checkpoints and fixes into their parent changes
     Finalize,
+
+    /// Adopt existing commits into a new task
+    Adopt {
+        /// Task goal (short description)
+        goal: String,
+
+        /// Adopt the last N commits
+        #[arg(long)]
+        last: Option<usize>,
+
+        /// Adopt all commits after this ref (exclusive)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// External ticket reference (e.g. PROJ-123)
+        #[arg(long = "ref")]
+        ticket_ref: Option<String>,
+    },
 }
 
 pub fn run(cmd: TaskCommand) -> Result<()> {
@@ -68,6 +86,9 @@ pub fn run(cmd: TaskCommand) -> Result<()> {
         TaskCommand::Abandon { reason } => run_abandon(reason),
         TaskCommand::Sync { cont, abort } => run_sync(cont, abort),
         TaskCommand::Finalize => run_finalize(),
+        TaskCommand::Adopt { goal, last, since, ticket_ref } => {
+            run_adopt(&goal, last, since, ticket_ref)
+        }
     }
 }
 
@@ -80,7 +101,7 @@ fn run_new(goal: &str, ticket_ref: Option<String>) -> Result<()> {
     let slug = if slug.len() > 40 { &slug[..40] } else { &slug };
     let branch = format!("task/{short_id}-{slug}");
 
-    let wt_path = git::worktree::create(&ctx.repo_root, slug, &branch)?;
+    let wt_path = git::worktree::create(&ctx.repo_root, slug, &branch, None)?;
     let wt_path_str = wt_path.display().to_string();
 
     let base_ref = git::repo::current_branch(&ctx.repo)?
@@ -624,6 +645,429 @@ fn run_finalize() -> Result<()> {
     println!("Finalize complete. {} clean commits remain.", new_shas.len());
 
     Ok(())
+}
+
+/// Adopt: promote existing commits into a new task.
+fn run_adopt(
+    goal: &str,
+    last: Option<usize>,
+    since: Option<String>,
+    ticket_ref: Option<String>,
+) -> Result<()> {
+    let ctx = ArcContext::open()?;
+
+    // Must not be inside a task worktree
+    if ctx.current_task_id()?.is_some() {
+        bail!("Already inside a task worktree. Run this from the main repo.");
+    }
+
+    let workdir = ctx.repo.workdir()
+        .context("bare repo not supported")?
+        .to_path_buf();
+
+    let null = std::process::Stdio::null;
+
+    // Stash all working state (staged + unstaged + untracked) so we can
+    // restore it in the task worktree after adopting.
+    let dirty = repo_has_changes(&workdir)?;
+    let has_stash = if dirty {
+        let stash_status = std::process::Command::new("git")
+            .args(["stash", "push", "--include-untracked", "-m", "arc-adopt-wip"])
+            .current_dir(&workdir)
+            .stdout(null()).stderr(null())
+            .status()
+            .context("Failed to stash working changes")?;
+        if !stash_status.success() {
+            bail!("Failed to stash working changes before adopt.");
+        }
+        true
+    } else {
+        false
+    };
+
+    // Determine the base commit (parent of oldest adopted commit)
+    let (base_sha, commit_shas) = select_commits(&workdir, last, since.as_deref())?;
+
+    if commit_shas.is_empty() {
+        bail!("No commits to adopt.");
+    }
+
+    // Warn if commits are on the remote tracking branch
+    let current_branch = git::repo::current_branch(&ctx.repo)?
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    let tracking_output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", &format!("{current_branch}@{{upstream}}")])
+        .current_dir(&workdir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(null())
+        .output()?;
+
+    if tracking_output.status.success() {
+        let upstream = String::from_utf8_lossy(&tracking_output.stdout).trim().to_string();
+        // Check if the oldest adopted commit is reachable from upstream
+        let oldest = &commit_shas[0];
+        let merge_base = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", oldest, &upstream])
+            .current_dir(&workdir)
+            .stdout(null()).stderr(null())
+            .status()?;
+        if merge_base.success() {
+            eprintln!("Warning: adopted commits are already on remote tracking branch '{upstream}'.");
+            eprintln!("Resetting will cause divergence — you may need to force push.");
+        }
+    }
+
+    // Create the task
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let short_id = &task_id[..8];
+    let slug = slug::slugify(goal);
+    let slug = if slug.len() > 40 { &slug[..40] } else { &slug };
+    let branch = format!("task/{short_id}-{slug}");
+
+    let wt_path = git::worktree::create(&ctx.repo_root, slug, &branch, Some(&base_sha))?;
+    let wt_path_str = wt_path.display().to_string();
+
+    let task = crate::metadata::task::Task {
+        id: task_id.clone(),
+        name: goal.to_string(),
+        goal: goal.to_string(),
+        status: crate::metadata::task::TaskStatus::InProgress,
+        branch: branch.clone(),
+        worktree_path: Some(wt_path_str.clone()),
+        base_ref: current_branch.clone(),
+        changes: Vec::new(),
+        created_at: Utc::now(),
+        completed_at: None,
+        ticket_ref: ticket_ref.clone(),
+        abandoned_reason: None,
+    };
+
+    ctx.db.execute(
+        "INSERT INTO tasks (id, name, goal, status, branch, worktree_path, base_ref, created_at, ticket_ref)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            task.id, task.name, task.goal, task.status.to_string(),
+            task.branch, task.worktree_path, task.base_ref,
+            task.created_at.to_rfc3339(),
+            ticket_ref,
+        ],
+    )?;
+
+    let json = serde_json::to_string_pretty(&task)?;
+    git::refs::write_ref(&ctx.repo, &format!("tasks/{task_id}.json"), &json)?;
+
+    // Cherry-pick each commit into the worktree, rewriting trailers
+    let mut adopted_change_ids: Vec<String> = Vec::new();
+
+    for original_sha in &commit_shas {
+        // Cherry-pick into the worktree
+        let cp_status = std::process::Command::new("git")
+            .args(["cherry-pick", original_sha])
+            .current_dir(&wt_path)
+            .stdout(null()).stderr(null())
+            .status()
+            .context("Failed to run git cherry-pick")?;
+
+        if !cp_status.success() {
+            bail!(
+                "Cherry-pick of {original_sha} failed. Aborting adopt.\n\
+                 The task branch and worktree were created but may be incomplete."
+            );
+        }
+
+        // Read the commit message
+        let msg_output = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(&wt_path)
+            .stdout(std::process::Stdio::piped())
+            .output()?;
+        let original_message = String::from_utf8_lossy(&msg_output.stdout).to_string();
+
+        // Parse existing arc metadata (if any)
+        let existing_meta = commit_message::parse(&original_message);
+        let (summary, intent) = commit_message::extract_summary_and_intent(&original_message);
+
+        let change_id;
+        let author_type;
+        let change_type;
+        let author_model;
+
+        if let Some(ref meta) = existing_meta {
+            // Preserve existing arc metadata, just add task
+            change_id = meta.change_id.clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            author_type = meta.author_type.clone()
+                .unwrap_or_else(|| "human".to_string());
+            change_type = meta.change_type.clone()
+                .unwrap_or_else(|| "change".to_string());
+            author_model = meta.author_model.clone();
+        } else {
+            // Plain git commit — generate full arc metadata
+            change_id = uuid::Uuid::new_v4().to_string();
+            author_type = "human".to_string();
+            change_type = "change".to_string();
+            author_model = None;
+        }
+
+        let new_metadata = commit_message::CommitMetadata {
+            change_id: Some(change_id.clone()),
+            author_type: Some(author_type.clone()),
+            author_model: author_model.clone(),
+            task_id: Some(task_id.clone()),
+            change_type: Some(change_type.clone()),
+            task_ref: ticket_ref.clone(),
+            session_id: existing_meta.as_ref().and_then(|m| m.session_id.clone()),
+            confidence: existing_meta.as_ref().and_then(|m| m.confidence),
+            prompt_hash: existing_meta.as_ref().and_then(|m| m.prompt_hash.clone()),
+            derived_from: existing_meta.as_ref().map(|m| m.derived_from.clone()).unwrap_or_default(),
+            parent_change_summary: existing_meta.as_ref().and_then(|m| m.parent_change_summary.clone()),
+        };
+
+        let new_message = commit_message::format(&summary, intent.as_deref(), &new_metadata);
+
+        // Amend the cherry-picked commit with the new message
+        let amend_status = std::process::Command::new("git")
+            .args(["commit", "--amend", "-m", &new_message])
+            .current_dir(&wt_path)
+            .stdout(null()).stderr(null())
+            .status()
+            .context("Failed to amend cherry-picked commit")?;
+
+        if !amend_status.success() {
+            bail!("Failed to amend commit with arc trailers.");
+        }
+
+        // Get new SHA after amend
+        let new_sha_output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt_path)
+            .stdout(std::process::Stdio::piped())
+            .output()?;
+        let new_sha = String::from_utf8_lossy(&new_sha_output.stdout).trim().to_string();
+
+        // Update SQLite: insert or update the change record
+        let existing_change: bool = ctx.db.query_row(
+            "SELECT COUNT(*) FROM changes WHERE id = ?1",
+            [&change_id],
+            |row| row.get::<_, i64>(0),
+        ).map(|c| c > 0).unwrap_or(false);
+
+        if existing_change {
+            ctx.db.execute(
+                "UPDATE changes SET git_sha = ?1, task_id = ?2 WHERE id = ?3",
+                rusqlite::params![new_sha, task_id, change_id],
+            )?;
+        } else {
+            ctx.db.execute(
+                "INSERT INTO changes (id, git_sha, summary, intent, author_type, author_name, task_id, change_type, status, created_at, author_model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10)",
+                rusqlite::params![
+                    change_id, new_sha, summary, intent,
+                    author_type, whoami(), task_id,
+                    change_type,
+                    Utc::now().to_rfc3339(),
+                    author_model,
+                ],
+            )?;
+        }
+
+        // Update change map
+        change::update_change_map(&ctx, &change_id, &new_sha)?;
+        adopted_change_ids.push(change_id);
+    }
+
+    // Update task ref JSON with change IDs
+    let ref_path = format!("tasks/{task_id}.json");
+    if let Some(json) = git::refs::read_ref(&ctx.repo, &ref_path)? {
+        let mut task: crate::metadata::task::Task = serde_json::from_str(&json)?;
+        task.changes = adopted_change_ids.clone();
+        let updated = serde_json::to_string_pretty(&task)?;
+        git::refs::write_ref(&ctx.repo, &ref_path, &updated)?;
+    }
+
+    // Reset the original branch to the base commit
+    let reset_status = std::process::Command::new("git")
+        .args(["reset", "--hard", &base_sha])
+        .current_dir(&workdir)
+        .stdout(null()).stderr(null())
+        .status()
+        .context("Failed to reset original branch")?;
+
+    if !reset_status.success() {
+        bail!("Failed to reset original branch to base commit.");
+    }
+
+    // Restore stashed working state in the task worktree
+    if has_stash {
+        // git stash is shared across worktrees, so we can pop in the task worktree
+        let pop_status = std::process::Command::new("git")
+            .args(["stash", "pop"])
+            .current_dir(&wt_path)
+            .stdout(null()).stderr(null())
+            .status()
+            .context("Failed to restore working state in task worktree")?;
+
+        if !pop_status.success() {
+            eprintln!("Warning: could not restore working state in task worktree.");
+            eprintln!("Your changes are still in `git stash`. Run `git stash pop` in the worktree.");
+        }
+    }
+
+    println!("Created task: {goal}");
+    println!("  Branch:   {branch}");
+    println!("  Worktree: {wt_path_str}");
+    println!("  Adopted:  {} commit(s)", commit_shas.len());
+    if let Some(ref tr) = ticket_ref {
+        println!("  Ref:      {tr}");
+    }
+    println!();
+    println!("Switch to it: arc task switch {slug}");
+
+    Ok(())
+}
+
+/// Select commits to adopt based on --last, --since, or default (ahead of upstream/merge-base).
+/// Returns (base_sha, vec_of_commit_shas) where base_sha is the parent of the oldest commit.
+fn select_commits(
+    workdir: &std::path::Path,
+    last: Option<usize>,
+    since: Option<&str>,
+) -> Result<(String, Vec<String>)> {
+    let null = std::process::Stdio::null;
+
+    if let Some(n) = last {
+        // --last N: take the last N commits
+        let log_output = std::process::Command::new("git")
+            .args(["log", "--reverse", "--format=%H", &format!("-{n}")])
+            .current_dir(workdir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(null())
+            .output()
+            .context("failed to run git log")?;
+
+        let shas: Vec<String> = String::from_utf8_lossy(&log_output.stdout)
+            .lines()
+            .map(String::from)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if shas.is_empty() {
+            return Ok((String::new(), vec![]));
+        }
+
+        let base = get_parent_sha(workdir, &shas[0])?;
+        Ok((base, shas))
+    } else if let Some(ref_name) = since {
+        // --since <ref>: all commits after ref
+        let log_output = std::process::Command::new("git")
+            .args(["log", "--reverse", "--format=%H", &format!("{ref_name}..HEAD")])
+            .current_dir(workdir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(null())
+            .output()
+            .context("failed to run git log")?;
+
+        let shas: Vec<String> = String::from_utf8_lossy(&log_output.stdout)
+            .lines()
+            .map(String::from)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if shas.is_empty() {
+            return Ok((String::new(), vec![]));
+        }
+
+        // Base is the ref itself (resolved to SHA)
+        let base_output = std::process::Command::new("git")
+            .args(["rev-parse", ref_name])
+            .current_dir(workdir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(null())
+            .output()?;
+        let base = String::from_utf8_lossy(&base_output.stdout).trim().to_string();
+
+        Ok((base, shas))
+    } else {
+        // Default: ahead of upstream tracking branch, or since merge-base with main/master
+        let upstream_output = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD@{upstream}"])
+            .current_dir(workdir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(null())
+            .output()?;
+
+        let base_ref = if upstream_output.status.success() {
+            String::from_utf8_lossy(&upstream_output.stdout).trim().to_string()
+        } else {
+            // No upstream — try main, then master
+            let main_exists = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", "main"])
+                .current_dir(workdir)
+                .stdout(null()).stderr(null())
+                .status()?;
+
+            if main_exists.success() {
+                "main".to_string()
+            } else {
+                "master".to_string()
+            }
+        };
+
+        // Find merge-base
+        let mb_output = std::process::Command::new("git")
+            .args(["merge-base", &base_ref, "HEAD"])
+            .current_dir(workdir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(null())
+            .output()
+            .context("failed to find merge-base")?;
+
+        if !mb_output.status.success() {
+            bail!("Could not find merge-base between '{base_ref}' and HEAD.");
+        }
+
+        let merge_base = String::from_utf8_lossy(&mb_output.stdout).trim().to_string();
+
+        let log_output = std::process::Command::new("git")
+            .args(["log", "--reverse", "--format=%H", &format!("{merge_base}..HEAD")])
+            .current_dir(workdir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(null())
+            .output()?;
+
+        let shas: Vec<String> = String::from_utf8_lossy(&log_output.stdout)
+            .lines()
+            .map(String::from)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        Ok((merge_base, shas))
+    }
+}
+
+/// Get the parent SHA of a commit. Returns the commit itself if it has no parent (root commit).
+fn get_parent_sha(workdir: &std::path::Path, sha: &str) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", &format!("{sha}^")])
+        .current_dir(workdir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        // Root commit — no parent, use the commit itself as base
+        Ok(sha.to_string())
+    }
+}
+
+fn whoami() -> String {
+    let config = git2::Config::open_default().ok();
+    config
+        .and_then(|c| c.get_string("user.name").ok())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 fn repo_has_changes(workdir: &std::path::Path) -> Result<bool> {

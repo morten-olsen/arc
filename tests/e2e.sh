@@ -408,6 +408,162 @@ git commit -m "$OLD_MSG" --quiet 2>&1
 OUT=$(git log -1 --format=%B 2>&1)
 assert_contains "squashed-from compat: old trailer in commit" "$OUT" "arc:squashed-from:"
 
+# ─── Test: task adopt --last N ────────────────────────────────────────
+
+cd "$TMPDIR/repo"
+
+# Make commits on main (not in a task)
+echo "adopt1" > adopt1.rs
+$ARC_BIN change "Adopt first" 2>&1 >/dev/null
+echo "adopt2" > adopt2.rs
+$ARC_BIN change "Adopt second" 2>&1 >/dev/null
+
+MAIN_HEAD_BEFORE=$(git rev-parse HEAD)
+
+OUT=$($ARC_BIN task adopt "Adopted feature" --last 2 2>&1)
+assert_contains "adopt creates task" "$OUT" "Created task: Adopted feature"
+assert_contains "adopt shows count" "$OUT" "Adopted:  2 commit(s)"
+assert_contains "adopt shows branch" "$OUT" "Branch:"
+
+# Main should have been reset (no longer at the same HEAD)
+MAIN_HEAD_AFTER=$(git rev-parse HEAD)
+if [ "$MAIN_HEAD_BEFORE" != "$MAIN_HEAD_AFTER" ]; then
+    pass "adopt: main branch was reset"
+else
+    fail "adopt: main branch was reset" "HEAD unchanged"
+fi
+
+# The adopted files should NOT be on main anymore
+if [ ! -f adopt1.rs ]; then
+    pass "adopt: adopt1.rs removed from main"
+else
+    fail "adopt: adopt1.rs removed from main" "file still exists"
+fi
+
+# Find the worktree and verify commits are there with arc:task: trailer
+ADOPT_WT="$(find "$TMPDIR/repo/.arc/worktrees" -maxdepth 1 -mindepth 1 -type d -name "adopted*" | head -1)"
+if [ -n "$ADOPT_WT" ]; then
+    pass "adopt: worktree created"
+else
+    fail "adopt: worktree created" "no worktree found"
+fi
+
+if [ -n "$ADOPT_WT" ]; then
+    # Check files exist in worktree
+    if [ -f "$ADOPT_WT/adopt1.rs" ] && [ -f "$ADOPT_WT/adopt2.rs" ]; then
+        pass "adopt: files present in worktree"
+    else
+        fail "adopt: files present in worktree" "missing files"
+    fi
+
+    # Check commit messages have arc:task: trailer
+    cd "$ADOPT_WT"
+    OUT=$(git log --format=%B -2 2>&1)
+    assert_contains "adopt: commits have arc:task trailer" "$OUT" "arc:task:"
+    assert_contains "adopt: commits have change id" "$OUT" "arc:change:id:"
+
+    cd "$TMPDIR/repo"
+fi
+
+# ─── Test: task adopt (default — all ahead of upstream) ──────────────
+
+# Make more commits on main
+echo "default1" > default1.rs
+$ARC_BIN change "Default adopt first" 2>&1 >/dev/null
+echo "default2" > default2.rs
+$ARC_BIN change "Default adopt second" 2>&1 >/dev/null
+
+# Push to set up upstream tracking
+git push origin main --quiet 2>&1
+
+# Make commits that are ahead of upstream
+echo "ahead1" > ahead1.rs
+$ARC_BIN change "Ahead first" 2>&1 >/dev/null
+echo "ahead2" > ahead2.rs
+$ARC_BIN change "Ahead second" 2>&1 >/dev/null
+echo "ahead3" > ahead3.rs
+$ARC_BIN change "Ahead third" 2>&1 >/dev/null
+
+OUT=$($ARC_BIN task adopt "Default adopt test" 2>&1)
+assert_contains "default adopt creates task" "$OUT" "Created task: Default adopt test"
+assert_contains "default adopt count" "$OUT" "Adopted:  3 commit(s)"
+
+# Main should be back at origin/main
+MAIN_SHA=$(git rev-parse HEAD)
+ORIGIN_SHA=$(git rev-parse origin/main)
+if [ "$MAIN_SHA" = "$ORIGIN_SHA" ]; then
+    pass "default adopt: main reset to origin/main"
+else
+    fail "default adopt: main reset to origin/main" "main=$MAIN_SHA origin=$ORIGIN_SHA"
+fi
+
+# ─── Test: task adopt moves dirty working state ──────────────────────
+
+# Create a commit, then add untracked + staged + unstaged changes
+echo "tracked" > tracked_adopt.rs
+$ARC_BIN change "Tracked for dirty test" 2>&1 >/dev/null
+
+# Untracked file
+echo "untracked1" > untracked1.txt
+mkdir -p subdir
+echo "untracked2" > subdir/untracked2.txt
+
+# Unstaged modification to a committed file
+echo "modified content" >> tracked_adopt.rs
+
+# Staged change (new file)
+echo "staged" > staged_file.txt
+git add staged_file.txt
+
+OUT=$($ARC_BIN task adopt "Dirty state test" --last 1 2>&1)
+assert_contains "adopt with dirty state: creates task" "$OUT" "Created task: Dirty state test"
+
+# All dirty files should be gone from main
+if [ ! -f untracked1.txt ] && [ ! -f subdir/untracked2.txt ] && [ ! -f staged_file.txt ]; then
+    pass "adopt: dirty files removed from main"
+else
+    fail "adopt: dirty files removed from main" "files still exist"
+fi
+
+# All dirty files should be in the worktree
+DIRTY_WT="$(find "$TMPDIR/repo/.arc/worktrees" -maxdepth 1 -mindepth 1 -type d -name "dirty*" | head -1)"
+if [ -n "$DIRTY_WT" ]; then
+    if [ -f "$DIRTY_WT/untracked1.txt" ] && [ -f "$DIRTY_WT/subdir/untracked2.txt" ]; then
+        pass "adopt: untracked files present in worktree"
+    else
+        fail "adopt: untracked files present in worktree" "files missing"
+    fi
+    if [ -f "$DIRTY_WT/staged_file.txt" ]; then
+        pass "adopt: staged file present in worktree"
+    else
+        fail "adopt: staged file present in worktree" "missing"
+    fi
+    # Unstaged modification: tracked_adopt.rs should have "modified content"
+    if grep -q "modified content" "$DIRTY_WT/tracked_adopt.rs" 2>/dev/null; then
+        pass "adopt: unstaged modification present in worktree"
+    else
+        fail "adopt: unstaged modification present in worktree" "modification missing"
+    fi
+else
+    fail "adopt: dirty state worktree" "no worktree found"
+    fail "adopt: staged file present in worktree" "no worktree found"
+    fail "adopt: unstaged modification present in worktree" "no worktree found"
+fi
+
+# ─── Test: task adopt fails if no commits ────────────────────────────
+
+set +e
+OUT=$($ARC_BIN task adopt "No commits" --since HEAD 2>&1)
+ADOPT_EXIT=$?
+set -e
+assert_exit_code "adopt: fails if no commits" 1 "$ADOPT_EXIT"
+assert_contains "adopt: no commits message" "$OUT" "No commits to adopt"
+
+# ─── Test: task help shows adopt ─────────────────────────────────────
+
+OUT=$($ARC_BIN task --help 2>&1)
+assert_contains "task help shows adopt" "$OUT" "adopt"
+
 # ─── Results ──────────────────────────────────────────────────────────
 
 echo ""

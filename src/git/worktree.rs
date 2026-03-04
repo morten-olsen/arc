@@ -9,8 +9,9 @@ pub fn worktrees_dir(repo_root: &Path) -> Result<PathBuf> {
 }
 
 /// Create a worktree for a task.
+/// If `start_point` is provided, the worktree starts at that commit instead of HEAD.
 /// Returns the path to the new worktree.
-pub fn create(repo_root: &Path, slug: &str, branch: &str) -> Result<PathBuf> {
+pub fn create(repo_root: &Path, slug: &str, branch: &str, start_point: Option<&str>) -> Result<PathBuf> {
     let wt_dir = worktrees_dir(repo_root)?;
     let wt_path = wt_dir.join(slug);
 
@@ -18,9 +19,13 @@ pub fn create(repo_root: &Path, slug: &str, branch: &str) -> Result<PathBuf> {
         bail!("Worktree already exists at {}", wt_path.display());
     }
 
-    let status = std::process::Command::new("git")
-        .args(["worktree", "add", "-b", branch])
-        .arg(&wt_path)
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["worktree", "add", "-b", branch]);
+    cmd.arg(&wt_path);
+    if let Some(sp) = start_point {
+        cmd.arg(sp);
+    }
+    let status = cmd
         .current_dir(repo_root)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
