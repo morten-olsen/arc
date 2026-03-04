@@ -4,6 +4,7 @@ pub mod hook;
 pub mod init;
 pub mod intent;
 pub mod log;
+pub mod project;
 pub mod pull;
 pub mod push;
 pub mod task;
@@ -33,6 +34,10 @@ pub enum Command {
     /// Manage tasks
     #[command(subcommand)]
     Task(task::TaskCommand),
+
+    /// Manage registered projects across repositories
+    #[command(subcommand)]
+    Project(project::ProjectCommand),
 
     /// Declare a new change (creates a commit, optionally empty)
     Change {
@@ -140,6 +145,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Init => init::run(),
         Command::ShellInit => init::run_shell_init(),
         Command::Task(cmd) => task::run(cmd),
+        Command::Project(cmd) => project::run(cmd),
         Command::Change { summary, intent, agent, model, amend } => {
             if amend {
                 change::run_amend(summary, intent, agent, model)

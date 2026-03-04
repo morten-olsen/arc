@@ -48,6 +48,13 @@ pub fn run() -> Result<()> {
     git::refs::write_ref(&repo, "config.json", &config.to_string())?;
 
     println!("Initialized Arc.");
+
+    // Auto-register in global project registry (non-fatal)
+    match auto_register(repo_root) {
+        Ok(name) => println!("  Registered as project: {name}"),
+        Err(e) => eprintln!("  Note: could not register in global registry: {e}"),
+    }
+
     println!();
     println!("Add this to your shell profile for task switching:");
     println!("  eval \"$(arc shell-init)\"");
@@ -79,11 +86,26 @@ fn ensure_gitignore(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn auto_register(repo_root: &Path) -> Result<String> {
+    let canonical = std::fs::canonicalize(repo_root)?;
+    let name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unnamed".into());
+    let conn = crate::global::open_registry()?;
+    let path_str = canonical.display().to_string();
+    crate::global::register_project(&conn, &path_str, &name, &[])?;
+    Ok(name)
+}
+
 fn shell_wrapper() -> &'static str {
     r#"arc() {
     if [ "$1" = "task" ] && [ "$2" = "switch" ]; then
         local dir
         dir="$(command arc task switch-path "$3")" && cd "$dir"
+    elif [ "$1" = "project" ] && [ "$2" = "switch" ]; then
+        local dir
+        dir="$(command arc project switch-path "$3")" && cd "$dir"
     else
         command arc "$@"
     fi

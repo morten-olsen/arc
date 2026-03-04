@@ -17,6 +17,8 @@ Git porcelain for structured commits, intent tracking, and agent attribution. Wr
 - `src/index/change_map.rs` — UUID↔SHA mapping (currently simpler HashMap, not the multi-branch design from docs)
 - `src/git/refs.rs` — Read/write blobs under `refs/arc/*`
 - `src/commands/mod.rs` — CLI definition (clap derive)
+- `src/global.rs` — Global project registry (`$XDG_DATA_HOME/arc/registry.db`)
+- `src/commands/project.rs` — `arc project` subcommands (add/remove/edit/list/status/switch)
 
 ## Build & test
 
@@ -38,3 +40,6 @@ cargo build && bash tests/e2e.sh    # e2e (bash script, not cargo)
 - **ChangeMap is simpler than spec** — flat `HashMap<UUID, SHA>`, not the multi-branch/canonical structure described in design.md and git-interop.md
 - **`--model` implies `--agent`** — passing a model name auto-sets agent authorship
 - **Docs are living documents** — update docs when assumptions change or discrepancies between docs and code are discovered (e.g. ChangeMap divergence from spec)
+- **`arc project` commands work from anywhere** — they use `global::open_registry()`, not `ArcContext`
+- **`project switch` needs shell wrapper** — same pattern as `task switch`, requires `eval "$(arc shell-init)"`
+- **Global registry failure is non-fatal on init** — `arc init` still succeeds if registry can't be written

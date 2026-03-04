@@ -27,7 +27,9 @@
       "Bash(test:*)",
       "WebSearch",
       "WebFetch(domain:github.com)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(echo:*)"
     ]
   }
 }

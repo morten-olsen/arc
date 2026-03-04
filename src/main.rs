@@ -2,6 +2,7 @@ mod commands;
 mod context;
 mod format;
 mod git;
+mod global;
 mod index;
 mod metadata;
 

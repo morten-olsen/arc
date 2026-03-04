@@ -64,6 +64,9 @@ assert_line_count() {
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
+# Isolate global registry from real user data
+export XDG_DATA_HOME="$TMPDIR/xdg-data"
+
 echo "Arc CLI End-to-End Tests"
 echo "========================"
 echo "Binary: $ARC_BIN"
@@ -550,19 +553,162 @@ else
     fail "adopt: unstaged modification present in worktree" "no worktree found"
 fi
 
-# ─── Test: task adopt fails if no commits ────────────────────────────
+# ─── Test: task adopt with ONLY dirty state (no commits ahead) ───────
+
+cd "$TMPDIR/repo"
+git checkout main --quiet 2>/dev/null
+echo "dirty-only content" > dirty_only.txt
+mkdir -p dirty_only_dir
+echo "another dirty file" > dirty_only_dir/file.txt
+git add dirty_only.txt  # staged but not committed
+
+OUT=$($ARC_BIN task adopt "Dirty only test" 2>&1)
+assert_contains "adopt dirty-only: creates task" "$OUT" "Created task: Dirty only test"
+assert_contains "adopt dirty-only: shows working changes" "$OUT" "working changes"
+
+# dirty files should be gone from main
+if [ ! -f dirty_only.txt ] && [ ! -f dirty_only_dir/file.txt ]; then
+    pass "adopt dirty-only: files removed from main"
+else
+    fail "adopt dirty-only: files removed from main" "files still exist"
+fi
+
+# dirty files should be in the worktree
+DIRTY_ONLY_WT="$(find "$TMPDIR/repo/.arc/worktrees" -maxdepth 1 -mindepth 1 -type d -name "dirty-only*" | head -1)"
+if [ -n "$DIRTY_ONLY_WT" ]; then
+    if [ -f "$DIRTY_ONLY_WT/dirty_only.txt" ] && [ -f "$DIRTY_ONLY_WT/dirty_only_dir/file.txt" ]; then
+        pass "adopt dirty-only: files present in worktree"
+    else
+        fail "adopt dirty-only: files present in worktree" "files missing"
+    fi
+else
+    fail "adopt dirty-only: files present in worktree" "no worktree found"
+fi
+
+# ─── Test: task adopt fails if no commits and no dirty state ─────────
 
 set +e
 OUT=$($ARC_BIN task adopt "No commits" --since HEAD 2>&1)
 ADOPT_EXIT=$?
 set -e
 assert_exit_code "adopt: fails if no commits" 1 "$ADOPT_EXIT"
-assert_contains "adopt: no commits message" "$OUT" "No commits to adopt"
+assert_contains "adopt: no commits message" "$OUT" "No commits or working changes to adopt"
 
 # ─── Test: task help shows adopt ─────────────────────────────────────
 
 OUT=$($ARC_BIN task --help 2>&1)
 assert_contains "task help shows adopt" "$OUT" "adopt"
+
+# ─── Test: arc init auto-registers in global registry ────────────────
+
+cd "$TMPDIR"
+git init project-alpha --quiet
+cd project-alpha
+git config user.email "test@test.com"
+git config user.name "Test User"
+git config commit.gpgsign false
+echo "hello" > README.md
+git add -A && git commit -m "init" --quiet
+
+OUT=$($ARC_BIN init 2>&1)
+assert_contains "init auto-registers" "$OUT" "Registered as project: project-alpha"
+
+# ─── Test: arc project list ─────────────────────────────────────────
+
+OUT=$($ARC_BIN project list 2>&1)
+assert_contains "project list shows auto-registered" "$OUT" "project-alpha"
+
+# ─── Test: arc project add with name and tag ────────────────────────
+
+cd "$TMPDIR"
+git init project-beta --quiet
+cd project-beta
+git config user.email "test@test.com"
+git config user.name "Test User"
+git config commit.gpgsign false
+echo "hello" > README.md
+git add -A && git commit -m "init" --quiet
+$ARC_BIN init 2>&1 >/dev/null
+
+# Re-register with explicit name and tags (add from a different dir)
+cd "$TMPDIR"
+OUT=$($ARC_BIN project add "$TMPDIR/project-beta" --name beta --tag context:test --tag area:cli 2>&1)
+# Already registered by init, so it says so
+assert_contains "project add already registered" "$OUT" "Already registered"
+
+# Remove and re-add with custom name
+$ARC_BIN project remove project-beta 2>&1 >/dev/null
+OUT=$($ARC_BIN project add "$TMPDIR/project-beta" --name beta --tag context:test --tag area:cli 2>&1)
+assert_contains "project add with name" "$OUT" "Registered: beta"
+assert_contains "project add shows tags" "$OUT" "context:test"
+
+# ─── Test: arc project list --tag ───────────────────────────────────
+
+OUT=$($ARC_BIN project list --tag context:test 2>&1)
+assert_contains "project list --tag filters" "$OUT" "beta"
+assert_not_contains "project list --tag excludes untagged" "$OUT" "project-alpha"
+
+# ─── Test: arc project edit (add/remove tags, rename) ───────────────
+
+OUT=$($ARC_BIN project edit beta --add-tag team:platform 2>&1)
+assert_contains "project edit add-tag" "$OUT" "Updated: beta"
+
+OUT=$($ARC_BIN project list --tag team:platform 2>&1)
+assert_contains "project edit: new tag visible" "$OUT" "beta"
+
+OUT=$($ARC_BIN project edit beta --remove-tag context:test 2>&1)
+assert_contains "project edit remove-tag" "$OUT" "Updated: beta"
+
+OUT=$($ARC_BIN project list --tag context:test 2>&1)
+assert_not_contains "project edit: removed tag gone" "$OUT" "beta"
+
+OUT=$($ARC_BIN project edit beta --name beta-renamed 2>&1)
+assert_contains "project edit rename" "$OUT" "Updated: beta-renamed"
+
+OUT=$($ARC_BIN project list 2>&1)
+assert_contains "project edit: new name in list" "$OUT" "beta-renamed"
+
+# ─── Test: arc project status ───────────────────────────────────────
+
+OUT=$($ARC_BIN project status 2>&1)
+assert_contains "project status shows project" "$OUT" "project-alpha"
+
+# ─── Test: arc project switch-path ──────────────────────────────────
+
+OUT=$($ARC_BIN project switch-path project-alpha 2>&1)
+assert_contains "project switch-path returns path" "$OUT" "$TMPDIR/project-alpha"
+
+# ─── Test: arc project remove ───────────────────────────────────────
+
+OUT=$($ARC_BIN project remove beta-renamed 2>&1)
+assert_contains "project remove" "$OUT" "Removed: beta-renamed"
+
+OUT=$($ARC_BIN project list 2>&1)
+assert_not_contains "project remove: gone from list" "$OUT" "beta-renamed"
+
+# ─── Test: project error cases ──────────────────────────────────────
+
+set +e
+OUT=$($ARC_BIN project remove nonexistent 2>&1)
+RC=$?
+set -e
+assert_exit_code "project remove nonexistent fails" 1 "$RC"
+assert_contains "project remove nonexistent message" "$OUT" "No project named"
+
+set +e
+OUT=$($ARC_BIN project add "$TMPDIR" 2>&1)
+RC=$?
+set -e
+assert_exit_code "project add non-arc repo fails" 1 "$RC"
+assert_contains "project add non-arc message" "$OUT" "Not an Arc repository"
+
+# ─── Test: help shows project ───────────────────────────────────────
+
+OUT=$($ARC_BIN --help 2>&1)
+assert_contains "help shows project" "$OUT" "project"
+
+# Return to repo for any subsequent tests
+cd "$TMPDIR/repo"
 
 # ─── Results ──────────────────────────────────────────────────────────
 
